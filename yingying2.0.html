@@ -1,0 +1,969 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>江南侠迹-璎璎2.0</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#0d0f0e; font-family:"KaiTi","STKaiti","Microsoft YaHei",serif; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; background:#c9c6b6; cursor:default; image-rendering:auto; }
+  /* 隐藏系统光标（画笔状态下用自绘光标） */
+  canvas.brush { cursor:none; }
+  #hud {
+    position:fixed; top:14px; left:16px; color:#f2efe4; z-index:10;
+    text-shadow:0 1px 3px rgba(0,0,0,.6); pointer-events:none; user-select:none;
+    font-size:15px; line-height:1.7;
+  }
+  #hud .title { font-size:22px; letter-spacing:3px; margin-bottom:6px; color:#f7f4e8;}
+  #hud .tip { font-size:13px; opacity:.85; }
+  #brushTag {
+    position:fixed; top:14px; right:18px; z-index:10; color:#fff;
+    font-size:15px; padding:6px 14px; border-radius:20px;
+    background:rgba(0,0,0,.35); backdrop-filter:blur(2px); user-select:none;
+    text-shadow:0 1px 2px rgba(0,0,0,.6);
+  }
+  #banner {
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    flex-direction:column; z-index:20; color:#fff; pointer-events:none;
+    background:rgba(10,20,16,.45); backdrop-filter:blur(3px); opacity:0; transition:opacity .5s;
+  }
+  #banner.show { opacity:1; }
+  #banner .big { font-size:56px; letter-spacing:12px; text-shadow:0 3px 14px rgba(0,0,0,.7); }
+  #banner .sub { font-size:18px; opacity:.9; margin-top:14px; letter-spacing:4px;}
+  .ui-hidden { display:none !important; }
+
+  /* 右下角当前毛笔指示 */
+  #brushHud {
+    position:fixed; right:24px; bottom:22px; z-index:12;
+    display:flex; flex-direction:column; align-items:center; gap:8px;
+    user-select:none; pointer-events:none;
+  }
+  #brushHud .pen {
+    width:58px; height:58px; border-radius:50%;
+    border:3px solid rgba(255,255,255,.8);
+    box-shadow:0 5px 16px rgba(0,0,0,.45);
+    display:flex; align-items:center; justify-content:center;
+    transition:background .3s;
+    position:relative; overflow:hidden;
+  }
+  /* 笔头小标记 */
+  #brushHud .pen::after {
+    content:''; width:0; height:0;
+    border-left:9px solid transparent; border-right:9px solid transparent;
+    border-top:22px solid rgba(255,255,255,.85);
+    transform:rotate(-20deg);
+  }
+  #brushHud .name {
+    color:#f7f4e8; font-size:17px; letter-spacing:3px;
+    text-shadow:0 1px 4px rgba(0,0,0,.7);
+  }
+  @keyframes penPop {
+    0%   { transform:scale(.25) rotate(-18deg); }
+    55%  { transform:scale(1.35) rotate(6deg); }
+    78%  { transform:scale(.92) rotate(-2deg); }
+    100% { transform:scale(1) rotate(0); }
+  }
+  #brushHud.pop .pen { animation:penPop .5s cubic-bezier(.2,.8,.3,1.25); }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+
+<div id="hud" class="ui-hidden">
+  <div class="title">山水丹青 · 一笔通关</div>
+  <div class="tip">A/D 行走 &nbsp;·&nbsp; 空格 跳跃 &nbsp;·&nbsp; R 重开 &nbsp;·&nbsp; Tab 显隐信息</div>
+  <div class="tip">毛笔自动切换：有敌人=朱笔斩敌，无敌人=黑毫画桥</div>
+  <div class="tip">按住左键拖动作画，一笔成形有长度上限；右键重置笔迹</div>
+  <div class="tip">手柄：左摇杆移动 · A 跳跃 · 按住 RT 呼出毛笔（推杆移动光标，按住 A 绘制）</div>
+</div>
+<div id="brushTag" class="ui-hidden">当前：无笔</div>
+<div id="brushHud"><div class="pen"></div><div class="name">黑毫</div></div>
+<div id="banner"><div class="big"></div><div class="sub"></div></div>
+
+<script>
+"use strict";
+/* ============================================================
+   山水丹青 · H5 横版闯关
+   纯 Canvas 实现：角色移动/跳跃、黑笔画桥（重力+碰撞）、
+   红笔斩敌、沟壑、到达终点通关、R 重开。
+   ============================================================ */
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const brushTag = document.getElementById('brushTag');
+const banner = document.getElementById('banner');
+
+// 逻辑分辨率（相机视口），实际按窗口缩放
+const VIEW_W = 1000, VIEW_H = 560;
+let scale = 1, offX = 0, offY = 0;
+
+function resize(){
+  // 镜头固定，不做缩放：画布保持逻辑 1:1 尺寸
+  const dpr = devicePixelRatioSafe();
+  scale = 1;
+  canvas.width = VIEW_W * dpr;
+  canvas.height = VIEW_H * dpr;
+  canvas.style.width = VIEW_W + 'px';
+  canvas.style.height = VIEW_H + 'px';
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+function devicePixelRatioSafe(){ return Math.min(window.devicePixelRatio||1, 2); }
+window.addEventListener('resize', resize);
+
+// ================= 关卡定义 =================
+const GROUND_Y = 470;         // 地面顶部
+const WORLD_H = 560;
+// 地面平台（矩形，含沟壑=平台之间的空隙）
+let platforms, enemies, goalX, WORLD_W, slopes;
+
+function buildLevel(){
+  platforms = [
+    {x:-200, y:GROUND_Y, w:1000, h:300},   // 起始段  (-200 ~ 800)
+    // 沟壑 800 ~ 1010
+    {x:1010, y:GROUND_Y, w:1000, h:300},    // 第二段 (1010 ~ 2010)
+    // 沟壑 2010 ~ 2230
+    {x:2230, y:GROUND_Y, w:1500, h:300},    // 第三段 + 终点 (2230 ~ 3730)
+  ];
+  // 一些高低台阶点缀
+  platforms.push({x:1300, y:GROUND_Y-90, w:150, h:20});
+
+  // 斜坡地形：上坡 -> 平台 -> 下坡（可沿坡行走）
+  slopes = [
+    {x1:2600, y1:GROUND_Y,     x2:2820, y2:GROUND_Y-120},  // 上坡
+    {x1:2820, y1:GROUND_Y-120, x2:3080, y2:GROUND_Y-120},  // 坡顶平台
+    {x1:3080, y1:GROUND_Y-120, x2:3300, y2:GROUND_Y},      // 下坡
+  ];
+
+  WORLD_W = 3600;
+  goalX = 3520;
+
+  enemies = [
+    makeEnemy(1250, GROUND_Y),
+    makeEnemy(1650, GROUND_Y),
+    makeEnemy(2400, GROUND_Y),
+    makeEnemy(2950, GROUND_Y-120),   // 坡顶平台上的敌人
+    makeEnemy(3430, GROUND_Y),
+  ];
+  enemies[3].patrol=110;             // 坡顶巡逻范围
+  enemies[4].patrol=60;
+}
+
+function makeEnemy(x, groundY){
+  return {
+    x, y:groundY-44, w:34, h:44, vx:(Math.random()<.5?-1:1)*0.9,
+    baseY:groundY, alive:true, dying:0, patrol:70, ox:x, phase:Math.random()*6.28
+  };
+}
+
+// ================= 角色 =================
+const player = {
+  x:80, y:GROUND_Y-64, w:34, h:64,
+  vx:0, vy:0, onGround:false, face:1,
+  animWalk:0, animState:'idle', dead:false
+};
+
+// ================= 输入 =================
+const keys = {};
+let brush = 0; // 0无 1黑 2红
+const mouse = { x:0, y:0, wx:0, wy:0, down:false };
+
+// 输入设备与手柄状态
+let lastInput='mouse';
+let padMoveX=0;                                   // 手柄左摇杆水平量（非绘制时用于移动）
+const padCursor = { x:VIEW_W/2, y:VIEW_H/2 };     // 手柄毛笔光标（屏幕坐标）
+const pad = { rt:false, aPrev:false, drawing:false };
+
+window.addEventListener('keydown', e=>{
+  const k = e.key.toLowerCase();
+  keys[k] = true;
+  if(k==='r'){ restart(); }
+  else if(k==='tab'){ e.preventDefault(); toggleUI(); }
+  else if(k===' '){ e.preventDefault(); tryJump(); }
+});
+window.addEventListener('keyup', e=>{ keys[e.key.toLowerCase()] = false; });
+
+let uiVisible=false;
+const hudEl=document.getElementById('hud');
+function toggleUI(){
+  uiVisible=!uiVisible;
+  hudEl.classList.toggle('ui-hidden', !uiVisible);
+  brushTag.classList.toggle('ui-hidden', !uiVisible);
+}
+
+const brushHud = document.getElementById('brushHud');
+const penEl = brushHud.querySelector('.pen');
+const nameEl = brushHud.querySelector('.name');
+
+function setBrush(b){
+  if(b===brush) return;
+  brush = b;
+  const isRed = b===2;
+  brushTag.textContent = '当前：' + (isRed?'朱笔（斩敌）':'黑毫（画桥）');
+  canvas.classList.toggle('brush', b!==0);
+  // 右下角指示 + 放缩切换动效
+  penEl.style.background = isRed ? '#b81f22' : '#141210';
+  nameEl.textContent = isRed ? '朱笔' : '黑毫';
+  brushHud.classList.remove('pop');
+  void brushHud.offsetWidth;      // 强制回流以重启动画
+  brushHud.classList.add('pop');
+}
+
+// 根据画面中是否有存活敌人，自动切换毛笔（作画中不打断）
+function autoBrush(){
+  if(cur) return;
+  let enemyOnScreen=false;
+  for(const en of enemies){
+    if(en.alive && en.x+en.w > camera.x+10 && en.x < camera.x+VIEW_W-10){
+      enemyOnScreen=true; break;
+    }
+  }
+  const desired = enemyOnScreen ? 2 : 1;
+  if(desired!==brush) setBrush(desired);
+}
+
+// XBOX 手柄：左摇杆移动，A 跳跃；按住 RT 呼出毛笔光标（左摇杆移动光标），
+// RT 期间按住 A 绘制、松 A 停笔，松 RT 隐藏光标
+let padConnected=false;
+window.addEventListener('gamepadconnected', e=>{ padConnected=true; });
+window.addEventListener('gamepaddisconnected', e=>{ padConnected=false; });
+
+function handleGamepad(){
+  padMoveX=0;
+  const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+  let g=null;
+  for(let i=0;i<gps.length;i++){ if(gps[i] && gps[i].connected){ g=gps[i]; break; } }
+  if(!g){
+    return;
+  }
+
+  const dz=0.18;
+  const sx=g.axes[0]||0, sy=g.axes[1]||0;
+  // 扳机在部分驱动上是 button.value，也可能映射为 axis，做兼容
+  const rt = Math.max(triggerVal(g,7), axisTrigger(g)) > 0.4;
+  const aBtn = !!(g.buttons[0] && g.buttons[0].pressed);
+
+  let active=false;
+  for(let i=0;i<g.buttons.length;i++){ if(g.buttons[i] && g.buttons[i].pressed){ active=true; break; } }
+  if(Math.abs(sx)>dz || Math.abs(sy)>dz || rt || active) lastInput='pad';
+  pad.rt=rt;
+
+  if(rt){
+    padCursor.x = Math.max(0, Math.min(VIEW_W, padCursor.x + sx*9));
+    padCursor.y = Math.max(0, Math.min(VIEW_H, padCursor.y + sy*9));
+    const wx = padCursor.x + camera.x, wy = padCursor.y;
+    if(aBtn && !pad.aPrev){ if(brush!==0) beginStroke(wx,wy); pad.drawing=true; }
+    else if(aBtn && pad.drawing){ extendStroke(wx,wy); }
+    else if(!aBtn && pad.aPrev && pad.drawing){ finishStroke(); pad.drawing=false; }
+  } else {
+    if(Math.abs(sx)>dz) padMoveX = sx;
+    if(aBtn && !pad.aPrev) tryJump();
+    if(pad.drawing){ finishStroke(); pad.drawing=false; }
+  }
+  pad.aPrev = aBtn;
+}
+function triggerVal(g, idx){
+  const b=g.buttons[idx];
+  if(!b) return 0;
+  return (b.value!=null) ? b.value : (b.pressed?1:0);
+}
+function axisTrigger(g){
+  // 某些设备把扳机放在高位轴上，取其归一化正值
+  if(g.axes.length>=6){ return Math.max(0,(g.axes[5]+1)/2); }
+  return 0;
+}
+
+// 屏幕坐标 -> 世界坐标
+function screenToWorld(clientX, clientY){
+  const rect = canvas.getBoundingClientRect();
+  const sx = (clientX-rect.left)/scale;
+  const sy = (clientY-rect.top)/scale;
+  return { sx, sy, wx: sx+camera.x, wy: sy };
+}
+
+canvas.addEventListener('mousemove', e=>{
+  lastInput='mouse';
+  const p = screenToWorld(e.clientX, e.clientY);
+  mouse.x=p.sx; mouse.y=p.sy; mouse.wx=p.wx; mouse.wy=p.wy;
+  if(mouse.down && brush!==0) extendStroke(p.wx, p.wy);
+});
+canvas.addEventListener('mousedown', e=>{
+  lastInput='mouse';
+  if(e.button===2){ resetInk(); return; }   // 右键：重置笔迹
+  if(e.button!==0) return;
+  const p = screenToWorld(e.clientX, e.clientY);
+  mouse.x=p.sx; mouse.y=p.sy; mouse.wx=p.wx; mouse.wy=p.wy;
+  mouse.down=true;
+  if(brush!==0) beginStroke(p.wx, p.wy);
+});
+window.addEventListener('mouseup', e=>{
+  if(e.button!==0) return;
+  mouse.down=false;
+  finishStroke();
+});
+canvas.addEventListener('contextmenu', e=>e.preventDefault());
+
+function tryJump(){
+  if(player.onGround && !player.dead){
+    player.vy = -12.6;
+    player.onGround=false;
+    player.animState='jump';
+  }
+}
+
+// ================= 画笔笔迹 =================
+const MAX_LEN = 300;       // 一笔最大长度
+const SAMPLE = 7;          // 采样间距
+let cur = null;            // 当前正在画的笔迹
+let inkBodies = [];        // 黑笔生成的实体（含下落物理）
+let redStrokes = [];       // 红笔笔迹（渐隐特效）
+
+function beginStroke(wx, wy){
+  if(brush===1){ inkBodies.length=0; }   // 黑笔一笔成形：重画即取消上一笔
+  cur = { pts:[{x:wx,y:wy}], len:0, color:brush };
+}
+function extendStroke(wx, wy){
+  if(!cur) return;
+  const last = cur.pts[cur.pts.length-1];
+  const dx=wx-last.x, dy=wy-last.y;
+  const d=Math.hypot(dx,dy);
+  if(d<2) return;
+  if(cur.len + d > MAX_LEN){
+    // 达到上限：截断到刚好 MAX_LEN
+    const rem = MAX_LEN - cur.len;
+    if(rem>1){
+      const t=rem/d;
+      cur.pts.push({x:last.x+dx*t, y:last.y+dy*t});
+      cur.len = MAX_LEN;
+    }
+    return;
+  }
+  // 细分采样，保证点密度用于碰撞
+  const steps = Math.max(1, Math.floor(d/SAMPLE));
+  for(let i=1;i<=steps;i++){
+    const t=i/steps;
+    cur.pts.push({x:last.x+dx*t, y:last.y+dy*t});
+  }
+  cur.len += d;
+  // 红笔：实时检测斩敌
+  if(cur.color===2){
+    const np = cur.pts[cur.pts.length-1];
+    hitEnemiesAt(np.x, np.y, last.x, last.y);
+  }
+}
+function finishStroke(){
+  if(!cur){ return; }
+  if(cur.pts.length<2){ cur=null; return; }
+  if(cur.color===1){
+    // 黑笔 -> 生成刚体，加入重力下落（同一时刻只存在一笔）
+    inkBodies.length=0;
+    inkBodies.push(makeInkBody(cur.pts));
+  } else {
+    // 红笔 -> 渐隐特效
+    redStrokes.push({ pts:cur.pts, life:1.0 });
+  }
+  cur=null;
+}
+
+// 右键或断笔重画：清空当前笔迹与已生成的黑笔实体
+function resetInk(){
+  cur=null;
+  mouse.down=false;
+  inkBodies.length=0;
+}
+
+// 黑笔实体：真实刚体（形状固定，仅整体平移+旋转，绝不形变）
+function makeInkBody(pts){
+  let cx=0, cy=0;
+  for(const p of pts){ cx+=p.x; cy+=p.y; }
+  cx/=pts.length; cy/=pts.length;
+  const local = pts.map(p=>({x:p.x-cx, y:p.y-cy}));
+  let I=0;
+  for(const l of local){ I += l.x*l.x + l.y*l.y; }
+  const mass = pts.length;
+  return {
+    local, cx, cy, angle:0, vx:0, vy:0, omega:0,
+    invMass:1/mass, invI: I>0?1/I:0,
+    settled:false, still:0
+  };
+}
+// 计算刚体各点的世界坐标（形状恒定）
+function bodyWorld(b){
+  const c=Math.cos(b.angle), s=Math.sin(b.angle), out=[];
+  for(const l of b.local){
+    out.push({x:b.cx + l.x*c - l.y*s, y:b.cy + l.x*s + l.y*c});
+  }
+  return out;
+}
+
+// 红笔斩敌：线段扫过敌人矩形
+function hitEnemiesAt(x2,y2,x1,y1){
+  for(const en of enemies){
+    if(!en.alive) continue;
+    if(segIntersectRect(x1,y1,x2,y2, en.x, en.y, en.w, en.h)){
+      en.alive=false; en.dying=1.0;
+    }
+  }
+}
+
+// ================= 物理工具 =================
+function segIntersectRect(x1,y1,x2,y2, rx,ry,rw,rh){
+  // 端点在内
+  if(pointInRect(x1,y1,rx,ry,rw,rh)||pointInRect(x2,y2,rx,ry,rw,rh)) return true;
+  return segSeg(x1,y1,x2,y2, rx,ry, rx+rw,ry) ||
+         segSeg(x1,y1,x2,y2, rx+rw,ry, rx+rw,ry+rh) ||
+         segSeg(x1,y1,x2,y2, rx+rw,ry+rh, rx,ry+rh) ||
+         segSeg(x1,y1,x2,y2, rx,ry+rh, rx,ry);
+}
+function pointInRect(x,y,rx,ry,rw,rh){ return x>=rx&&x<=rx+rw&&y>=ry&&y<=ry+rh; }
+function segSeg(a,b,c,d, p,q,r,s){
+  const d1=(r-p)*(b-q)-(s-q)*(a-p);
+  const d2=(r-p)*(d-q)-(s-q)*(c-p);
+  const d3=(c-a)*(q-b)-(d-b)*(p-a);
+  const d4=(c-a)*(s-b)-(d-b)*(r-a);
+  if(((d1>0&&d2<0)||(d1<0&&d2>0))&&((d3>0&&d4<0)||(d3<0&&d4>0))) return true;
+  return false;
+}
+
+// 给定 x，求该点能落到的地面顶（平台上表面），无则 Infinity
+function surfaceAt(x){
+  let top = Infinity;
+  for(const p of platforms){
+    if(x>=p.x && x<=p.x+p.w){ top = Math.min(top, p.y); }
+  }
+  return top;
+}
+
+// 求脚下可站立的最高表面（平台顶 / 斜坡 / 已落定的黑笔笔迹段）
+// feet 为角色脚底 y，stepUp 用于排除高于头顶不可达的“墙”
+function supportY(x, feet, stepUp){
+  let best=Infinity;
+  const consider=(sy)=>{ if(sy>=feet-stepUp && sy<best) best=sy; };
+  for(const p of platforms){
+    if(x>=p.x && x<=p.x+p.w) consider(p.y);
+  }
+  for(const s of slopes){
+    const lo=Math.min(s.x1,s.x2), hi=Math.max(s.x1,s.x2);
+    if(x>=lo && x<=hi){
+      const t=(x-s.x1)/(s.x2-s.x1);
+      consider(s.y1 + (s.y2-s.y1)*t);
+    }
+  }
+  for(const b of inkBodies){
+    if(!b.settled && b.still<=5) continue;      // 落定/接近静止的笔迹才可踩
+    const wp=bodyWorld(b);
+    for(let i=0;i<wp.length-1;i++){
+      const a=wp[i], c=wp[i+1];
+      const lo=Math.min(a.x,c.x), hi=Math.max(a.x,c.x);
+      if(hi-lo>0.001 && x>=lo && x<=hi){
+        const t=(x-a.x)/(c.x-a.x);
+        consider(a.y + (c.y-a.y)*t);
+      }
+    }
+  }
+  return best;
+}
+
+// ================= 相机 =================
+const camera = { x:0 };
+function updateCamera(){
+  let target = player.x + player.w/2 - VIEW_W*0.4;
+  target = Math.max(0, Math.min(target, WORLD_W - VIEW_W));
+  camera.x += (target - camera.x)*0.12;
+}
+
+// ================= 更新 =================
+let goalReached=false;
+
+function update(){
+  handleGamepad();
+  // 墨迹实体：刚体动力学（下落+冲量翻倒），带穿透松弛与休眠，落地不抖动
+  const GRAV=0.42, SLOP=0.5, BAUM=0.4, FRIC=0.6;
+  for(const b of inkBodies){
+    if(b.settled) continue;
+    b.vy += GRAV;
+    b.vx*=0.99; b.omega*=0.98;
+    b.cx += b.vx; b.cy += b.vy; b.angle += b.omega;
+
+    let contact=false;
+    for(let it=0; it<6; it++){
+      const wp = bodyWorld(b);
+      let maxPen=0;
+      for(const p of wp){
+        const surf=surfaceAt(p.x);
+        if(surf===Infinity) continue;
+        const pen = p.y - surf;
+        if(pen<=0) continue;
+        contact=true;
+        if(pen>maxPen) maxPen=pen;
+        const rx=p.x-b.cx, ry=p.y-b.cy;
+        const vpx=b.vx - b.omega*ry;
+        const vpy=b.vy + b.omega*rx;
+        const vn=-vpy;                    // 法向 n=(0,-1)，无回弹
+        if(vn<0){
+          const denom = b.invMass + b.invI*(rx*rx);
+          const j = -vn/denom;
+          b.vy += (-j)*b.invMass;
+          b.omega += b.invI*(rx*(-j));
+          let jt = -vpx/denom;            // 摩擦
+          const mj = FRIC*Math.abs(j);
+          jt = Math.max(-mj, Math.min(mj, jt));
+          b.vx += jt*b.invMass;
+          b.omega += b.invI*(-ry*jt);
+        }
+      }
+      // 位置修正：留出松弛量并只修正一部分，避免上下弹跳抖动
+      if(maxPen>SLOP) b.cy -= (maxPen-SLOP)*BAUM;
+    }
+
+    // 休眠：接触且几乎静止 -> 顶出残余穿透并冻结，彻底杜绝抖动
+    const speed = Math.abs(b.vx)+Math.abs(b.vy)+Math.abs(b.omega)*40;
+    if(contact && speed<0.25){
+      if(++b.still>10){
+        let mp=0;
+        for(const p of bodyWorld(b)){ const s=surfaceAt(p.x); if(s!==Infinity) mp=Math.max(mp, p.y-s); }
+        if(mp>0) b.cy -= mp;
+        b.vx=b.vy=b.omega=0; b.settled=true;
+      }
+    } else b.still=0;
+
+    // 掉入沟壑（沉到地面以下）判定消失
+    if(b.cy > GROUND_Y + 80) b.dead=true;
+  }
+  inkBodies = inkBodies.filter(b=>!b.dead);
+
+  // 红笔渐隐
+  for(const r of redStrokes){ r.life -= 0.03; }
+  redStrokes = redStrokes.filter(r=>r.life>0);
+
+  // 敌人
+  for(const en of enemies){
+    if(!en.alive){ if(en.dying>0) en.dying-=0.06; continue; }
+    en.x += en.vx;
+    if(en.x < en.ox-en.patrol){ en.x=en.ox-en.patrol; en.vx*=-1; }
+    if(en.x > en.ox+en.patrol){ en.x=en.ox+en.patrol; en.vx*=-1; }
+    en.phase += 0.12;
+    // 撞角色 -> 死亡重开
+    if(!player.dead && rectsOverlap(player.x,player.y,player.w,player.h, en.x,en.y,en.w,en.h)){
+      killPlayer();
+    }
+  }
+
+  updatePlayer();
+  updateCamera();
+  autoBrush();
+
+  // 掉入沟壑
+  if(!player.dead && player.y > WORLD_H+120){ killPlayer(); }
+
+  // 通关
+  if(!goalReached && player.x+player.w/2 > goalX){
+    goalReached=true;
+    showBanner('通 关', '行于山水之间，以到中心。  （R 重开）');
+  }
+}
+
+function rectsOverlap(ax,ay,aw,ah,bx,by,bw,bh){
+  return ax<bx+bw && ax+aw>bx && ay<by+bh && ay+ah>by;
+}
+
+function updatePlayer(){
+  if(player.dead){ player.vy+=0.62; player.y+=player.vy; return; }
+
+  const accel=0.9, maxRun=4.4, fric=0.78, GRAVP=0.62;
+  const STEP_UP=18, STEP_DOWN=16;
+  let ix=0;
+  if(keys['a']) ix-=1;
+  if(keys['d']) ix+=1;
+  ix += padMoveX;                    // 手柄左摇杆
+  ix = Math.max(-1, Math.min(1, ix));
+  let moving=false;
+  if(Math.abs(ix)>0.1){ player.vx += accel*ix; player.face = ix<0?-1:1; moving=true; }
+  if(!moving){ player.vx*=fric; if(Math.abs(player.vx)<0.05) player.vx=0; }
+  player.vx=Math.max(-maxRun, Math.min(maxRun, player.vx));
+
+  // 水平移动（无侧墙，坡面靠高度模型处理）
+  player.x += player.vx;
+  if(player.x<0) player.x=0;
+  if(player.x>WORLD_W-player.w) player.x=WORLD_W-player.w;
+
+  const cx=player.x+player.w/2;
+  const feet=player.y+player.h;
+  let grounded=false;
+
+  // 在地面时：贴合坡面上/下行走（含笔迹斜面）
+  if(player.onGround){
+    const s=supportY(cx, feet, STEP_UP);
+    if(s!==Infinity){
+      const diff=s-feet;                       // >0 表面在脚下(下坡)，<0 表面高于脚(上坡)
+      if(diff>=-STEP_UP && diff<=STEP_DOWN){
+        player.y=s-player.h; player.vy=0; grounded=true;
+      }
+    }
+  }
+
+  // 空中/离地：重力下落并检测落地
+  if(!grounded){
+    player.vy+=GRAVP;
+    if(player.vy>18) player.vy=18;
+    const feetBefore=player.y+player.h;
+    player.y+=player.vy;
+    const feetAfter=player.y+player.h;
+    const s2=supportY(player.x+player.w/2, feetAfter, STEP_UP);
+    if(s2!==Infinity && player.vy>=0 && feetAfter>=s2 && feetBefore<=s2+STEP_UP){
+      player.y=s2-player.h; player.vy=0; grounded=true;
+    }
+  }
+  player.onGround=grounded;
+
+  // 动画状态
+  if(!player.onGround) player.animState = player.vy<0?'jump':'fall';
+  else if(Math.abs(player.vx)>0.4){ player.animState='walk'; player.animWalk+=Math.abs(player.vx)*0.05; }
+  else player.animState='idle';
+}
+
+function killPlayer(){
+  if(player.dead) return;
+  player.dead=true;
+  player.vx=0; player.vy=-6;
+  showBanner('折 戟', '（R 键重整旗鼓）');
+}
+
+function restart(){
+  buildLevel();
+  player.x=80; player.y=GROUND_Y-64; player.vx=0; player.vy=0;
+  player.onGround=false; player.face=1; player.dead=false; player.animWalk=0;
+  inkBodies=[]; redStrokes=[]; cur=null; mouse.down=false;
+  camera.x=0; goalReached=false;
+  hideBanner();
+}
+
+function showBanner(big, sub){
+  banner.querySelector('.big').textContent=big;
+  banner.querySelector('.sub').textContent=sub;
+  banner.classList.add('show');
+}
+function hideBanner(){ banner.classList.remove('show'); }
+
+// ================= 渲染 =================
+function draw(){
+  ctx.clearRect(0,0,VIEW_W,VIEW_H);
+  drawBackground();
+
+  ctx.save();
+  ctx.translate(-camera.x, 0);
+
+  drawPlatforms();
+  drawSlopes();
+  drawInk();
+  drawEnemies();
+  drawGoal();
+  drawPlayer();
+  drawCurrentStroke();
+
+  ctx.restore();
+
+  drawBrushCursor();
+}
+
+// --- 背景：青绿山水，分层视差 ---
+function drawBackground(){
+  // 天/宣纸底
+  let g = ctx.createLinearGradient(0,0,0,VIEW_H);
+  g.addColorStop(0,'#e8e6d6');
+  g.addColorStop(0.5,'#d9d8c4');
+  g.addColorStop(1,'#c7ccb4');
+  ctx.fillStyle=g; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+
+  // 远山（视差最慢）
+  drawMountainLayer(camera.x*0.15, '#9fb0a0', 120, 210, 7, 0.55);
+  // 瀑布
+  drawWaterfall(camera.x*0.2);
+  // 中山
+  drawMountainLayer(camera.x*0.35, '#7d9384', 200, 300, 6, 0.75);
+  // 近山雾
+  ctx.fillStyle='rgba(230,232,220,0.35)';
+  ctx.fillRect(0, 300, VIEW_W, 120);
+  drawMountainLayer(camera.x*0.6, '#5f7466', 300, 420, 5, 0.9);
+}
+
+function drawMountainLayer(scrollX, color, baseTop, baseBottom, count, alpha){
+  ctx.save();
+  ctx.globalAlpha=alpha;
+  ctx.fillStyle=color;
+  const span = VIEW_W/(count-1);
+  const seed = -(scrollX % (span*2));
+  ctx.beginPath();
+  ctx.moveTo(seed-span, baseBottom);
+  for(let i=-1;i<=count+1;i++){
+    const x = seed + i*span;
+    const peak = baseTop + ((Math.sin(i*1.7)+1)*0.5)*(baseBottom-baseTop)*0.55;
+    ctx.lineTo(x, peak);
+    ctx.lineTo(x+span*0.5, baseBottom-((Math.cos(i*2.1)+1)*0.5)*30);
+  }
+  ctx.lineTo(seed+(count+2)*span, baseBottom);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawWaterfall(scrollX){
+  const wx = 640 - scrollX*0.5;
+  ctx.save();
+  ctx.globalAlpha=0.7;
+  const g=ctx.createLinearGradient(wx,120,wx,320);
+  g.addColorStop(0,'rgba(255,255,255,0.9)');
+  g.addColorStop(1,'rgba(255,255,255,0.1)');
+  ctx.fillStyle=g;
+  ctx.fillRect(wx, 120, 34, 200);
+  ctx.restore();
+}
+
+function drawSlopes(){
+  if(!slopes) return;
+  for(const s of slopes){
+    const topY=Math.min(s.y1,s.y2);
+    let g=ctx.createLinearGradient(0,topY,0,topY+90);
+    g.addColorStop(0,'#8a8f5f');
+    g.addColorStop(0.15,'#6f7d4c');
+    g.addColorStop(1,'#4a5a38');
+    ctx.fillStyle=g;
+    ctx.beginPath();
+    ctx.moveTo(s.x1, s.y1);
+    ctx.lineTo(s.x2, s.y2);
+    ctx.lineTo(s.x2, s.y2+320);
+    ctx.lineTo(s.x1, s.y1+320);
+    ctx.closePath();
+    ctx.fill();
+    // 草边（沿坡面）
+    ctx.strokeStyle='#7f9a4e';
+    ctx.lineWidth=6; ctx.lineCap='round';
+    ctx.beginPath();
+    ctx.moveTo(s.x1, s.y1-2);
+    ctx.lineTo(s.x2, s.y2-2);
+    ctx.stroke();
+  }
+}
+
+function drawPlatforms(){
+  for(const p of platforms){
+    // 土坡
+    let g=ctx.createLinearGradient(0,p.y,0,p.y+80);
+    g.addColorStop(0,'#8a8f5f');
+    g.addColorStop(0.15,'#6f7d4c');
+    g.addColorStop(1,'#4a5a38');
+    ctx.fillStyle=g;
+    ctx.fillRect(p.x, p.y, p.w, p.h);
+    // 草边
+    ctx.fillStyle='#7f9a4e';
+    ctx.fillRect(p.x, p.y-4, p.w, 6);
+    // 苔点
+    ctx.fillStyle='rgba(40,60,30,0.35)';
+    for(let i=0;i<p.w;i+=46){
+      ctx.beginPath();
+      ctx.ellipse(p.x+i+((p.y*7)%40), p.y+14+((i*13)%40), 8, 3, 0,0,6.28);
+      ctx.fill();
+    }
+  }
+}
+
+function drawInk(){
+  for(const b of inkBodies){
+    drawStrokePath(bodyWorld(b), '#141210', 9, b.settled?1:0.9);
+  }
+}
+
+function drawStrokePath(pts, color, width, alpha){
+  if(pts.length<2) return;
+  ctx.save();
+  ctx.globalAlpha=alpha;
+  ctx.strokeStyle=color;
+  ctx.lineWidth=width;
+  ctx.lineCap='round';
+  ctx.lineJoin='round';
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x, pts[i].y);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawCurrentStroke(){
+  if(!cur) return;
+  const col = cur.color===1?'#141210':'#b81f22';
+  drawStrokePath(cur.pts, col, cur.color===1?9:7, 0.95);
+  // 长度提示条
+  const last=cur.pts[cur.pts.length-1];
+  const ratio=cur.len/MAX_LEN;
+  ctx.save();
+  ctx.globalAlpha=0.9;
+  ctx.fillStyle= ratio>0.95?'#b81f22':'#222';
+  ctx.fillRect(last.x-20, last.y-24, 40*ratio, 4);
+  ctx.strokeStyle='rgba(0,0,0,.4)';
+  ctx.strokeRect(last.x-20, last.y-24, 40, 4);
+  ctx.restore();
+}
+
+function drawRed(){}
+
+function drawEnemies(){
+  for(const en of enemies){
+    if(!en.alive && en.dying<=0) continue;
+    ctx.save();
+    const bob = en.alive?Math.sin(en.phase)*3:0;
+    if(!en.alive){ ctx.globalAlpha=Math.max(0,en.dying); }
+    // 妖影：墨团带触须
+    const cx=en.x+en.w/2, cy=en.y+en.h/2+bob;
+    ctx.fillStyle='#1a1614';
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, en.w/2, en.h/2, 0,0,6.28);
+    ctx.fill();
+    // 红眼
+    ctx.fillStyle='#d63b2f';
+    ctx.beginPath(); ctx.arc(cx-6, cy-4, 3,0,6.28); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx+6, cy-4, 3,0,6.28); ctx.fill();
+    // 触须
+    ctx.strokeStyle='#1a1614'; ctx.lineWidth=3; ctx.lineCap='round';
+    for(let i=-1;i<=1;i++){
+      ctx.beginPath();
+      ctx.moveTo(cx+i*8, cy+en.h/2-4);
+      ctx.quadraticCurveTo(cx+i*10, cy+en.h/2+8+Math.sin(en.phase+i)*4, cx+i*12, cy+en.h/2+16);
+      ctx.stroke();
+    }
+    if(!en.alive){
+      // 消散粒子
+      ctx.fillStyle='rgba(180,30,34,'+Math.max(0,en.dying)+')';
+      for(let i=0;i<6;i++){
+        const a=i*1.05, rr=(1-en.dying)*30;
+        ctx.beginPath(); ctx.arc(cx+Math.cos(a)*rr, cy+Math.sin(a)*rr, 2.5,0,6.28); ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+}
+
+function drawGoal(){
+  // 终点：亭 + 旗
+  const gx=goalX;
+  ctx.save();
+  ctx.strokeStyle='#3a2a1a'; ctx.lineWidth=4;
+  ctx.beginPath(); ctx.moveTo(gx, GROUND_Y); ctx.lineTo(gx, GROUND_Y-120); ctx.stroke();
+  ctx.fillStyle='#b81f22';
+  const fw=44, fh=30, fy=GROUND_Y-120;
+  ctx.beginPath();
+  ctx.moveTo(gx, fy);
+  ctx.lineTo(gx+fw, fy+fh*0.4);
+  ctx.lineTo(gx, fy+fh);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle='#f7f4e8'; ctx.font='16px KaiTi'; ctx.textAlign='center';
+  ctx.fillText('终', gx+16, fy+22);
+  ctx.restore();
+}
+
+// --- 角色：水墨侠女剪影，含行走/跳跃动画 ---
+function drawPlayer(){
+  const px=player.x, py=player.y, w=player.w, h=player.h;
+  const cx=px+w/2;
+  ctx.save();
+  ctx.translate(cx, py);
+  ctx.scale(player.face, 1);
+
+  let legSwing=0, armSwing=0, lean=0, hairFly=0;
+  if(player.animState==='walk'){
+    legSwing = Math.sin(player.animWalk)*10;
+    armSwing = Math.sin(player.animWalk)*8;
+    lean=2;
+  } else if(player.animState==='jump'){ legSwing=6; lean=6; hairFly=10; }
+  else if(player.animState==='fall'){ legSwing=-4; lean=4; hairFly=14; }
+  if(player.dead){ lean=20; }
+
+  const inkDark='#20242a', inkMid='#3a4550', robe='#4d5a68', robeL='#e9e7dc';
+
+  // 腿
+  ctx.strokeStyle=inkDark; ctx.lineWidth=8; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(0,h*0.62); ctx.lineTo(legSwing*0.6, h); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,h*0.62); ctx.lineTo(-legSwing*0.6, h); ctx.stroke();
+
+  // 裙袍
+  ctx.fillStyle=robe;
+  ctx.beginPath();
+  ctx.moveTo(-w*0.32, h*0.42);
+  ctx.lineTo(w*0.32, h*0.42);
+  ctx.lineTo(w*0.44+lean, h*0.66);
+  ctx.lineTo(-w*0.44+lean, h*0.66);
+  ctx.closePath(); ctx.fill();
+
+  // 上襦（白）
+  ctx.fillStyle=robeL;
+  ctx.beginPath();
+  ctx.moveTo(-w*0.28, h*0.2);
+  ctx.lineTo(w*0.28, h*0.2);
+  ctx.lineTo(w*0.32, h*0.45);
+  ctx.lineTo(-w*0.32, h*0.45);
+  ctx.closePath(); ctx.fill();
+  // 腰带
+  ctx.fillStyle='#7a5a3a';
+  ctx.fillRect(-w*0.3, h*0.4, w*0.6, 5);
+
+  // 手臂
+  ctx.strokeStyle=robeL; ctx.lineWidth=6;
+  ctx.beginPath(); ctx.moveTo(0,h*0.24); ctx.lineTo(armSwing+6, h*0.44); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0,h*0.24); ctx.lineTo(-armSwing-4, h*0.44); ctx.stroke();
+
+  // 头
+  ctx.fillStyle='#efe4d6';
+  ctx.beginPath(); ctx.arc(0, h*0.1, 9, 0,6.28); ctx.fill();
+  // 发（黑，飘）
+  ctx.fillStyle=inkDark;
+  ctx.beginPath(); ctx.arc(0, h*0.06, 10, Math.PI, 0); ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(-6, h*0.05);
+  ctx.quadraticCurveTo(-22-hairFly, h*0.02, -30-hairFly, h*0.22);
+  ctx.quadraticCurveTo(-16, h*0.16, -4, h*0.14);
+  ctx.closePath(); ctx.fill();
+
+  ctx.restore();
+}
+
+// --- 自绘毛笔光标 ---
+function drawBrushCursor(){
+  let x, y, show=false;
+  const padMode = padConnected || lastInput==='pad';
+  if(padMode){
+    if(pad.rt){ x=padCursor.x; y=padCursor.y; show=true; }  // 手柄：默认隐藏，仅按住 RT 显示
+  } else {
+    if(brush!==0){ x=mouse.x; y=mouse.y; show=true; }        // 鼠标：跟随光标
+  }
+  if(!show) return;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(-0.5);
+  // 笔杆
+  ctx.strokeStyle='#6b4a2a'; ctx.lineWidth=5; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(6,6); ctx.lineTo(30,30); ctx.stroke();
+  // 笔头
+  ctx.fillStyle= brush===1?'#111':'#a81c1f';
+  ctx.beginPath();
+  ctx.moveTo(0,0);
+  ctx.lineTo(10,4);
+  ctx.lineTo(4,10);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+// ================= 主循环 =================
+function loop(){
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+resize();
+buildLevel();
+restart();
+setBrush(1);   // 默认黑色毛笔
+loop();
+</script>
+</body>
+</html>
